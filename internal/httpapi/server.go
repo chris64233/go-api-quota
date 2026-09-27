@@ -23,6 +23,10 @@ func NewServer(svc *quota.Service) *Server {
 	s.mux.HandleFunc("POST /v1/consume", s.handleConsume)
 	s.mux.HandleFunc("POST /v1/refund", s.handleRefund)
 	s.mux.HandleFunc("GET /v1/balances", s.handleBalances)
+	s.mux.HandleFunc("POST /v1/reservations", s.handleReserve)
+	s.mux.HandleFunc("POST /v1/reservations/confirm", s.handleConfirmReservation)
+	s.mux.HandleFunc("POST /v1/reservations/cancel", s.handleCancelReservation)
+	s.mux.HandleFunc("GET /v1/reservations", s.handleGetReservation)
 	return s
 }
 
@@ -60,6 +64,10 @@ func writeError(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "refund_window_expired"
 	case errors.Is(err, quota.ErrRefundExceeds):
 		status, code = http.StatusConflict, "refund_exceeds"
+	case errors.Is(err, quota.ErrReservationNotFound):
+		status, code = http.StatusNotFound, "reservation_not_found"
+	case errors.Is(err, quota.ErrReservationStateConflict):
+		status, code = http.StatusConflict, "reservation_state_conflict"
 	}
 	writeJSON(w, status, errorBody{Error: apiError{Code: code, Message: err.Error()}})
 }
@@ -154,4 +162,65 @@ func (s *Server) handleBalances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"balances": balances})
+}
+
+func (s *Server) handleReserve(w http.ResponseWriter, r *http.Request) {
+	var req quota.ReserveRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.Reserve(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleConfirmReservation(w http.ResponseWriter, r *http.Request) {
+	var req quota.ReservationDecisionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.ConfirmReservation(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleCancelReservation(w http.ResponseWriter, r *http.Request) {
+	var req quota.ReservationDecisionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.CancelReservation(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleGetReservation(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	rec, err := s.svc.GetReservation(r.Context(), q.Get("request_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rec)
 }

@@ -11,13 +11,15 @@ import (
 // 正常负载下冲突极少，重试即可收敛；超过上限说明竞争异常激烈。
 const maxVersionRetries = 8
 
-// Service 实现三层配额的配置、消费、退还与查询。
+// Service 实现三层配额的配置、消费、退还、预占与查询。
 type Service struct {
 	store Store
 	// now 可注入，便于测试窗口切换。
 	now func() time.Time
 	// refundTTL 是消费成功后允许退还的时间范围。
 	refundTTL time.Duration
+	// reservationTTL 是预占缺省有效时长。
+	reservationTTL time.Duration
 }
 
 // Option 定制 Service 行为。
@@ -33,12 +35,18 @@ func WithRefundTTL(d time.Duration) Option {
 	return func(s *Service) { s.refundTTL = d }
 }
 
+// WithReservationTTL 设置预占的缺省有效时长（请求未显式指定时使用）。
+func WithReservationTTL(d time.Duration) Option {
+	return func(s *Service) { s.reservationTTL = d }
+}
+
 // NewService 创建配额服务。
 func NewService(store Store, opts ...Option) *Service {
 	s := &Service{
-		store:     store,
-		now:       time.Now,
-		refundTTL: 24 * time.Hour,
+		store:          store,
+		now:            time.Now,
+		refundTTL:      24 * time.Hour,
+		reservationTTL: time.Minute,
 	}
 	for _, o := range opts {
 		o(s)
@@ -143,6 +151,12 @@ func (s *Service) Consume(ctx context.Context, req ConsumeRequest) (ConsumeResul
 		windows := map[Level]int64{}
 		usages := map[Level]UsageRecord{}
 		versions := map[Level]int64{}
+
+		// 先回收到期预占，避免其继续占用可用额度。
+		if err := sweepExpiredReservations(tx, now); err != nil {
+			return err
+		}
+
 		for _, level := range Levels {
 			cfg, ok := tx.GetConfig(level, subjects[level])
 			if !ok {
@@ -155,11 +169,11 @@ func (s *Service) Consume(ctx context.Context, req ConsumeRequest) (ConsumeResul
 			if !ok {
 				usage = UsageRecord{Level: level, SubjectID: subjects[level], WindowStart: start}
 			}
-			if usage.Used+req.Amount > cfg.Limit {
+			if usage.Used+usage.Reserved+req.Amount > cfg.Limit {
 				return &insufficientError{
 					level:     level,
 					subjectID: subjects[level],
-					remaining: cfg.Limit - usage.Used,
+					remaining: cfg.Limit - usage.Used - usage.Reserved,
 					amount:    req.Amount,
 				}
 			}
@@ -298,7 +312,10 @@ func (s *Service) Balances(ctx context.Context, orgID, userID, keyID string) ([]
 }
 
 // loadBalances 在事务内读取三层余额；未配置的层级返回 ErrQuotaNotConfigured。
+// 已到期但尚未被惰性回收的预占不再占用可用额，因此视图会把这部分金额扣除。
 func loadBalances(tx *Tx, now func() time.Time, subjects map[Level]string) ([]LevelBalance, error) {
+	t := now()
+	expiredReserved := sumExpiredReserved(tx, t)
 	balances := make([]LevelBalance, 0, len(Levels))
 	for _, level := range Levels {
 		subjectID := subjects[level]
@@ -306,10 +323,15 @@ func loadBalances(tx *Tx, now func() time.Time, subjects map[Level]string) ([]Le
 		if !ok {
 			return nil, fmt.Errorf("%w: level=%s subject=%s", ErrQuotaNotConfigured, level, subjectID)
 		}
-		start := cfg.WindowStart(now())
-		used := int64(0)
+		start := cfg.WindowStart(t)
+		used, reserved := int64(0), int64(0)
 		if usage, ok := tx.GetUsage(level, subjectID, start); ok {
 			used = usage.Used
+			reserved = usage.Reserved
+		}
+		reserved -= expiredReserved[usageKey(level, subjectID, start)]
+		if reserved < 0 {
+			reserved = 0
 		}
 		balances = append(balances, LevelBalance{
 			Level:         level,
@@ -318,11 +340,27 @@ func loadBalances(tx *Tx, now func() time.Time, subjects map[Level]string) ([]Le
 			WindowStart:   start,
 			WindowEnd:     start + cfg.WindowSeconds,
 			Used:          used,
-			Remaining:     cfg.Limit - used,
+			Reserved:      reserved,
+			Remaining:     cfg.Limit - used - reserved,
 			ConfigVersion: cfg.Version,
 		})
 	}
 	return balances, nil
+}
+
+// sumExpiredReserved 汇总各窗口中已到期但仍标记为 reserved 的预占金额，
+// 键与 usageKey 一致。仅供只读余额视图使用；写路径会真正回收这些预占。
+func sumExpiredReserved(tx *Tx, now time.Time) map[string]int64 {
+	totals := map[string]int64{}
+	for _, rec := range tx.ReservationsByStatus(StatusReserved) {
+		if !rec.ExpiresAt.After(now) {
+			subjects := rec.subjects()
+			for _, level := range Levels {
+				totals[usageKey(level, subjects[level], rec.Windows[level])] += rec.Amount
+			}
+		}
+	}
+	return totals
 }
 
 // withRetry 在版本冲突时重试事务；其他错误直接返回。

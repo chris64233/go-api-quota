@@ -159,3 +159,135 @@ func TestHTTPRefundFlow(t *testing.T) {
 		t.Fatalf("exceeds: status=%d body=%v", resp.StatusCode, body)
 	}
 }
+
+func TestHTTPReservationLifecycle(t *testing.T) {
+	srv := newTestServer(t)
+	configureAll(t, srv.URL)
+
+	// 创建预占：三层各锁定 30，可用 70。
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"amount": 30, "ttl_seconds": 120,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("reserve status=%d body=%v", resp.StatusCode, body)
+	}
+	rsv := body["reservation"].(map[string]any)
+	if rsv["status"] != "reserved" {
+		t.Fatalf("status=%v, want reserved", rsv["status"])
+	}
+	for _, item := range body["balances"].([]any) {
+		b := item.(map[string]any)
+		if b["used"].(float64) != 0 || b["reserved"].(float64) != 30 || b["remaining"].(float64) != 70 {
+			t.Errorf("level %s used=%v reserved=%v remaining=%v, want 0/30/70",
+				b["level"], b["used"], b["reserved"], b["remaining"])
+		}
+	}
+
+	// 同号同内容重放 → 200 duplicate=true，不重复锁定。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"amount": 30, "ttl_seconds": 120,
+	})
+	if resp.StatusCode != http.StatusOK || body["duplicate"] != true {
+		t.Fatalf("duplicate reserve status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 同号异内容 → 409 idempotency_conflict。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"amount": 31, "ttl_seconds": 120,
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "idempotency_conflict" {
+		t.Fatalf("idempotency: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 查询预占状态。
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/reservations?request_id=rsv1", nil)
+	if resp.StatusCode != http.StatusOK || body["status"] != "reserved" {
+		t.Fatalf("get reservation status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 确认：reserved 转 used。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/confirm", map[string]any{
+		"request_id": "d1", "reservation_id": "rsv1",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("confirm status=%d body=%v", resp.StatusCode, body)
+	}
+	if body["reservation"].(map[string]any)["status"] != "confirmed" {
+		t.Fatalf("confirm body=%v", body)
+	}
+	if body["consume"] == nil || body["consume"].(map[string]any)["amount"].(float64) != 30 {
+		t.Fatalf("confirmed consume missing/wrong: %v", body["consume"])
+	}
+	for _, item := range body["balances"].([]any) {
+		b := item.(map[string]any)
+		if b["used"].(float64) != 30 || b["reserved"].(float64) != 0 {
+			t.Errorf("after confirm level %s used=%v reserved=%v, want 30/0",
+				b["level"], b["used"], b["reserved"])
+		}
+	}
+
+	// 确认操作幂等重放 → 200 duplicate=true。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/confirm", map[string]any{
+		"request_id": "d1", "reservation_id": "rsv1",
+	})
+	if resp.StatusCode != http.StatusOK || body["duplicate"] != true {
+		t.Fatalf("duplicate confirm status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 已终态再取消 → 409 reservation_state_conflict。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/cancel", map[string]any{
+		"request_id": "d2", "reservation_id": "rsv1",
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "reservation_state_conflict" {
+		t.Fatalf("state conflict: status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestHTTPReservationCancelAndInsufficient(t *testing.T) {
+	srv := newTestServer(t)
+	configureAll(t, srv.URL)
+
+	// 预占超额 → 409 insufficient_quota。
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv-big", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"amount": 101, "ttl_seconds": 120,
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "insufficient_quota" {
+		t.Fatalf("insufficient: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 正常预占后取消，额度全部退回。
+	doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"amount": 40, "ttl_seconds": 120,
+	})
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/cancel", map[string]any{
+		"request_id": "x1", "reservation_id": "rsv1",
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("cancel status=%d body=%v", resp.StatusCode, body)
+	}
+	if body["reservation"].(map[string]any)["status"] != "cancelled" {
+		t.Fatalf("cancel body=%v", body)
+	}
+	resp, body = doJSON(t, http.MethodGet,
+		srv.URL+"/v1/balances?org_id=org-1&user_id=user-1&key_id=key-1", nil)
+	for _, item := range body["balances"].([]any) {
+		b := item.(map[string]any)
+		if b["reserved"].(float64) != 0 || b["remaining"].(float64) != 100 {
+			t.Errorf("after cancel level %s reserved=%v remaining=%v, want 0/100",
+				b["level"], b["reserved"], b["remaining"])
+		}
+	}
+
+	// 未知预占 → 404 reservation_not_found。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/cancel", map[string]any{
+		"request_id": "x2", "reservation_id": "nope",
+	})
+	if resp.StatusCode != http.StatusNotFound || body["error"].(map[string]any)["code"] != "reservation_not_found" {
+		t.Fatalf("not found: status=%d body=%v", resp.StatusCode, body)
+	}
+}

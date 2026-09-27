@@ -106,6 +106,54 @@ func (tx *Tx) PutRefund(rec RefundRecord) error {
 	return nil
 }
 
+// GetReservation 按外部请求号读取预占记录。
+func (tx *Tx) GetReservation(requestID string) (rec ReservationRecord, ok bool) {
+	rec, ok = tx.state.Reservations[requestID]
+	return rec, ok
+}
+
+// PutReservation 以 expectedVersion 为条件写入预占记录；新建时传 0。
+func (tx *Tx) PutReservation(rec ReservationRecord, expectedVersion int64) error {
+	cur, ok := tx.state.Reservations[rec.RequestID]
+	if ok && cur.Version != expectedVersion {
+		return fmt.Errorf("%w: reservation %s stored=%d expected=%d",
+			ErrVersionConflict, rec.RequestID, cur.Version, expectedVersion)
+	}
+	if !ok && expectedVersion != 0 {
+		return fmt.Errorf("%w: reservation %s absent, expected version %d",
+			ErrVersionConflict, rec.RequestID, expectedVersion)
+	}
+	rec.Version = expectedVersion + 1
+	tx.state.Reservations[rec.RequestID] = rec
+	return nil
+}
+
+// ReservationsByStatus 返回处于指定状态的全部预占记录，供过期回收扫描。
+func (tx *Tx) ReservationsByStatus(status ReservationStatus) []ReservationRecord {
+	var out []ReservationRecord
+	for _, rec := range tx.state.Reservations {
+		if rec.Status == status {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// GetReservationOp 按外部请求号读取确认/取消操作记录。
+func (tx *Tx) GetReservationOp(requestID string) (rec ReservationOpRecord, ok bool) {
+	rec, ok = tx.state.ReservationOps[requestID]
+	return rec, ok
+}
+
+// PutReservationOp 写入确认/取消操作记录（请求号即主键，不允许覆盖）。
+func (tx *Tx) PutReservationOp(rec ReservationOpRecord) error {
+	if _, ok := tx.state.ReservationOps[rec.RequestID]; ok {
+		return fmt.Errorf("%w: reservation op %s already exists", ErrVersionConflict, rec.RequestID)
+	}
+	tx.state.ReservationOps[rec.RequestID] = rec
+	return nil
+}
+
 // Store 提供事务化的额度数据访问。
 type Store interface {
 	// Update 在写事务中执行 fn；fn 返回错误则整体回滚，
@@ -117,18 +165,22 @@ type Store interface {
 
 // fileState 是持久化到磁盘的全部业务数据。
 type fileState struct {
-	Configs  map[string]QuotaConfig   `json:"configs"`
-	Usages   map[string]UsageRecord   `json:"usages"`
-	Consumes map[string]ConsumeRecord `json:"consumes"`
-	Refunds  map[string]RefundRecord  `json:"refunds"`
+	Configs        map[string]QuotaConfig         `json:"configs"`
+	Usages         map[string]UsageRecord         `json:"usages"`
+	Consumes       map[string]ConsumeRecord       `json:"consumes"`
+	Refunds        map[string]RefundRecord        `json:"refunds"`
+	Reservations   map[string]ReservationRecord   `json:"reservations"`
+	ReservationOps map[string]ReservationOpRecord `json:"reservation_ops"`
 }
 
 func newFileState() *fileState {
 	return &fileState{
-		Configs:  map[string]QuotaConfig{},
-		Usages:   map[string]UsageRecord{},
-		Consumes: map[string]ConsumeRecord{},
-		Refunds:  map[string]RefundRecord{},
+		Configs:        map[string]QuotaConfig{},
+		Usages:         map[string]UsageRecord{},
+		Consumes:       map[string]ConsumeRecord{},
+		Refunds:        map[string]RefundRecord{},
+		Reservations:   map[string]ReservationRecord{},
+		ReservationOps: map[string]ReservationOpRecord{},
 	}
 }
 
@@ -175,6 +227,20 @@ func (s *fileState) clone() *fileState {
 	}
 	for k, v := range s.Refunds {
 		c.Refunds[k] = v
+	}
+	for k, v := range s.Reservations {
+		// Windows 是 map，需深拷贝，避免副本与原状态共享底层 map。
+		if v.Windows != nil {
+			windows := make(map[Level]int64, len(v.Windows))
+			for lk, lv := range v.Windows {
+				windows[lk] = lv
+			}
+			v.Windows = windows
+		}
+		c.Reservations[k] = v
+	}
+	for k, v := range s.ReservationOps {
+		c.ReservationOps[k] = v
 	}
 	return c
 }

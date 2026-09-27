@@ -46,6 +46,10 @@ var (
 	ErrRefundWindowExpired = errors.New("refund window expired")
 	// ErrRefundExceeds 累计退还超过原消费金额。
 	ErrRefundExceeds = errors.New("refund exceeds consumed amount")
+	// ErrReservationNotFound 预占记录不存在。
+	ErrReservationNotFound = errors.New("reservation not found")
+	// ErrReservationStateConflict 预占不在允许该操作的状态（已终态）。
+	ErrReservationStateConflict = errors.New("reservation state conflict")
 )
 
 // QuotaConfig 是某一层级某个主体的配额配置。
@@ -73,11 +77,17 @@ func (c QuotaConfig) Contains(start int64, t time.Time) bool {
 // UsageRecord 记录某主体在某个窗口内已使用的额度。
 // 以窗口起点为键的一部分，因此窗口切换后旧窗口的用量仍然保留，
 // 退还才能精确回到原消费所属窗口。
+//
+// Used 是已正式消费的额度；Reserved 是已预占但尚未确认的额度。
+// 二者都会占用可用额度：remaining = limit - used - reserved。
+// 预占确认时金额从 Reserved 转为 Used；取消或到期只释放 Reserved，
+// 且只操作预占记录保存的原窗口。
 type UsageRecord struct {
 	Level       Level  `json:"level"`
 	SubjectID   string `json:"subject_id"`
 	WindowStart int64  `json:"window_start"`
 	Used        int64  `json:"used"`
+	Reserved    int64  `json:"reserved"`
 	Version     int64  `json:"version"`
 }
 
@@ -114,6 +124,79 @@ type RefundRecord struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+// ReservationStatus 是预占的生命周期状态。
+type ReservationStatus string
+
+const (
+	// StatusReserved 预占生效中：三层额度已保留，等待确认或取消。
+	StatusReserved ReservationStatus = "reserved"
+	// StatusConfirmed 已确认：预占转为正式消费（终态）。
+	StatusConfirmed ReservationStatus = "confirmed"
+	// StatusCancelled 已取消：额度退回原窗口（终态）。
+	StatusCancelled ReservationStatus = "cancelled"
+	// StatusExpired 已到期：系统自动回收，额度退回原窗口（终态）。
+	StatusExpired ReservationStatus = "expired"
+)
+
+// Terminal 报告状态是否为终态；终态之间不可再迁移。
+func (s ReservationStatus) Terminal() bool {
+	return s == StatusConfirmed || s == StatusCancelled || s == StatusExpired
+}
+
+// ReservationRecord 是一次配额预占。
+// Windows 保存预占发生时三个层级各自的窗口起点；确认只把这些窗口里的
+// Reserved 转为 Used，取消或到期只释放这些窗口里的 Reserved，
+// 即使窗口已经切换也绝不触碰新窗口。
+type ReservationRecord struct {
+	RequestID string `json:"request_id"`
+	OrgID     string `json:"org_id"`
+	UserID    string `json:"user_id"`
+	KeyID     string `json:"key_id"`
+	Amount    int64  `json:"amount"`
+	// TTLSeconds 是预占请求的有效时长（秒），按请求语义做幂等比较；
+	// ExpiresAt = CreatedAt + TTLSeconds。
+	TTLSeconds int64 `json:"ttl_seconds"`
+	// Windows 记录预占发生时各层级所属窗口的起点。
+	Windows   map[Level]int64   `json:"windows"`
+	Status    ReservationStatus `json:"status"`
+	ExpiresAt time.Time         `json:"expires_at"`
+	CreatedAt time.Time         `json:"created_at"`
+	// DecidedAt 是进入终态的时间，reserved 状态下为零值。
+	DecidedAt time.Time `json:"decided_at"`
+	// ConsumeRequestID 确认后生成的正式消费记录请求号。
+	ConsumeRequestID string `json:"consume_request_id,omitempty"`
+	Version          int64  `json:"version"`
+}
+
+// subjects 返回预占涉及的三层主体。
+func (r ReservationRecord) subjects() map[Level]string {
+	return map[Level]string{LevelOrg: r.OrgID, LevelUser: r.UserID, LevelKey: r.KeyID}
+}
+
+// sameContent 判断两次同号预占请求的内容是否一致（TTL 秒数也必须一致）。
+func (r ReservationRecord) sameContent(orgID, userID, keyID string, amount, ttlSeconds int64) bool {
+	return r.OrgID == orgID && r.UserID == userID && r.KeyID == keyID &&
+		r.Amount == amount && r.TTLSeconds == ttlSeconds
+}
+
+// ReservationOp 区分确认与取消操作，用于操作幂等键，
+// 防止同一个请求号先用于确认、后又用于取消。
+type ReservationOp string
+
+const (
+	opConfirm ReservationOp = "confirm"
+	opCancel  ReservationOp = "cancel"
+)
+
+// ReservationOpRecord 记录确认/取消操作的幂等键，
+// 同时保证同一请求号不能跨操作或跨预占复用。
+type ReservationOpRecord struct {
+	RequestID     string        `json:"request_id"`
+	Op            ReservationOp `json:"op"`
+	ReservationID string        `json:"reservation_id"`
+	CreatedAt     time.Time     `json:"created_at"`
+}
+
 // LevelBalance 是某一层级的余额视图。
 type LevelBalance struct {
 	Level         Level  `json:"level"`
@@ -122,6 +205,7 @@ type LevelBalance struct {
 	WindowStart   int64  `json:"window_start"`
 	WindowEnd     int64  `json:"window_end"`
 	Used          int64  `json:"used"`
+	Reserved      int64  `json:"reserved"`
 	Remaining     int64  `json:"remaining"`
 	ConfigVersion int64  `json:"config_version"`
 }
@@ -138,6 +222,22 @@ type RefundResult struct {
 	Refund    RefundRecord  `json:"refund"`
 	Consume   ConsumeRecord `json:"consume"`
 	Duplicate bool          `json:"duplicate"`
+}
+
+// ReserveResult 是预占接口的返回结果。
+type ReserveResult struct {
+	Reservation ReservationRecord `json:"reservation"`
+	Balances    []LevelBalance    `json:"balances"`
+	Duplicate   bool              `json:"duplicate"`
+}
+
+// ReservationDecisionResult 是确认/取消接口的返回结果。
+type ReservationDecisionResult struct {
+	Reservation ReservationRecord `json:"reservation"`
+	// Consume 仅确认时返回生成的正式消费记录。
+	Consume   *ConsumeRecord `json:"consume,omitempty"`
+	Balances  []LevelBalance `json:"balances"`
+	Duplicate bool           `json:"duplicate"`
 }
 
 // insufficientError 携带具体层级信息，便于调用方定位是哪一层超额。
