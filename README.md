@@ -10,12 +10,14 @@
 - **并发安全**：每条额度记录（配置 / 窗口用量 / 消费记录）都带版本号，写入必须满足版本条件，冲突时自动重试；并发请求不会超额，也不会丢失更新。
 - **幂等**：消费与退还都以调用方提供的 `request_id` 为幂等键。同号同内容返回首次结果（`duplicate: true`），同号异内容返回 `idempotency_conflict`。
 - **退还**：成功消费在退还时限内（默认 24h，可用 `-refund-ttl` 调整）允许部分或全部退还，可多次退，累计不超过原消费金额；退还请求同样幂等。
-- **窗口**：左闭右开区间 `[start, start+window_seconds)`，按 Unix 纪元对齐。用量按窗口起点独立记录，因此即使窗口切换与消费、退还并发发生，退还也只回补原消费所属窗口，绝不补充新窗口额度。
-- **持久化**：业务数据（配置、各窗口用量、消费与退还记录）以 JSON 文件原子落盘（临时文件 + rename），重启后状态完整恢复。
+- **预占（reservation）**：预占不立即消费，而是在一个事务内同时保留组织、用户、访问密钥三层当前窗口的可用额度（`reserved`），任一层不足整笔失败。业务结束后可**确认**（reserved 转为正式 used）或**取消**（释放 reserved）；超过有效期（默认 5m，可用 `-reservation-ttl` 调整，也可在请求中用 `ttl_seconds` 指定）未确认则**自动到期回收**。确认、取消、到期只能作用于预占时记录的**原窗口**，窗口切换后绝不补充新窗口。预占状态机为 `reserved → confirmed / cancelled / expired`，后三者为终态，并发操作只形成一个终态。预占同样以 `request_id` 幂等；预占中的额度与正式消费一样占用窗口余额（`remaining = limit - used - reserved`）。
+- **窗口**：左闭右开区间 `[start, start+window_seconds)`，按 Unix 纪元对齐。用量按窗口起点独立记录，因此即使窗口切换与消费、退还、预占结算并发发生，退还与预占结算也只回补原窗口，绝不补充新窗口额度。
+- **持久化**：业务数据（配置、各窗口用量、消费、退还与预占记录）以 JSON 文件原子落盘（临时文件 + rename），重启后状态完整恢复，启动时自动回收重启期间到期的预占。
 
 ## 运行
 
-    go run ./cmd/server -addr :8080 -data quota-store.json [-refund-ttl 24h]
+    go run ./cmd/server -addr :8080 -data quota-store.json \
+        [-refund-ttl 24h] [-reservation-ttl 5m] [-expiry-interval 1s]
 
 ## API
 
@@ -26,11 +28,13 @@
 | `validation` | 400 | 参数不合法 |
 | `quota_not_configured` | 404 | 该层级未配置配额 |
 | `consume_not_found` | 404 | 退还的原消费不存在 |
-| `insufficient_quota` | 409 | 当前窗口某层额度不足 |
+| `reservation_not_found` | 404 | 预占不存在 |
+| `insufficient_quota` | 409 | 当前窗口某层额度不足（消费或预占） |
 | `idempotency_conflict` | 409 | 同请求号不同内容 |
 | `version_conflict` | 409 | 版本条件不满足 |
 | `refund_window_expired` | 409 | 超出退还时限 |
 | `refund_exceeds` | 409 | 累计退还超过原消费 |
+| `reservation_state_conflict` | 409 | 预占已处于终态，操作不被允许（如确认已取消/已到期的预占） |
 
 ### 配置配额
 
@@ -53,11 +57,44 @@
     POST /v1/refund
     {"request_id": "r-1", "consume_request_id": "c-1", "amount": 5}
 
+### 预占
+
+    POST /v1/reservations
+    {"request_id": "rsv-1", "org_id": "org-1", "user_id": "u-1", "key_id": "k-1",
+     "amount": 10, "ttl_seconds": 300}
+
+三层当前窗口可用额度都足够时返回 `201`，余额视图中三层均为 `used=0, reserved=10, remaining=limit-used-reserved`。
+同号同内容重放返回 `200` 且 `duplicate: true`；同号异内容返回 `409 idempotency_conflict`。
+`ttl_seconds` 可省略，省略时使用服务端 `-reservation-ttl`（默认 5 分钟）。
+
+确认（转为正式消费，生成请求号为 `reservation:<预占请求号>` 的消费记录，之后可按普通消费退还）：
+
+    POST /v1/reservations/confirm
+    {"request_id": "rsv-1"}
+
+取消（额度退回原窗口）：
+
+    POST /v1/reservations/cancel
+    {"request_id": "rsv-1"}
+
+确认/取消重复调用返回首次结果（`duplicate: true`）；对已处于其他终态的预占操作返回
+`409 reservation_state_conflict`。已过期的预占会在确认/取消/查询时被惰性回收，
+也可由后台定时任务或手动触发批量扫描：
+
+    POST /v1/reservations/expire        # 返回 {"expired": ["rsv-1", ...]}
+
+查询预占状态：
+
+    GET /v1/reservations?request_id=rsv-1
+
+> 即使预占期间发生窗口切换，确认/取消/到期也只调整预占时记录的原窗口用量，
+> 不会把额度补到新窗口。
+
 ### 三层余额查询
 
     GET /v1/balances?org_id=org-1&user_id=u-1&key_id=k-1
 
-返回三个层级当前窗口的 `limit` / `used` / `remaining` 及窗口起止时间。
+返回三个层级当前窗口的 `limit` / `used` / `reserved` / `remaining` 及窗口起止时间。
 
 ## 代码结构
 

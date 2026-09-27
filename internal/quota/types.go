@@ -46,6 +46,10 @@ var (
 	ErrRefundWindowExpired = errors.New("refund window expired")
 	// ErrRefundExceeds 累计退还超过原消费金额。
 	ErrRefundExceeds = errors.New("refund exceeds consumed amount")
+	// ErrReservationNotFound 预占记录不存在。
+	ErrReservationNotFound = errors.New("reservation not found")
+	// ErrReservationState 预占当前状态不允许该操作（如对已取消的预占再确认）。
+	ErrReservationState = errors.New("reservation state conflict")
 )
 
 // QuotaConfig 是某一层级某个主体的配额配置。
@@ -73,11 +77,15 @@ func (c QuotaConfig) Contains(start int64, t time.Time) bool {
 // UsageRecord 记录某主体在某个窗口内已使用的额度。
 // 以窗口起点为键的一部分，因此窗口切换后旧窗口的用量仍然保留，
 // 退还才能精确回到原消费所属窗口。
+//
+// Used 是已正式消费的额度；Reserved 是预占中、尚未形成终态的额度。
+// 两者都占用窗口额度，窗口内的可用额度为 Limit - Used - Reserved。
 type UsageRecord struct {
 	Level       Level  `json:"level"`
 	SubjectID   string `json:"subject_id"`
 	WindowStart int64  `json:"window_start"`
 	Used        int64  `json:"used"`
+	Reserved    int64  `json:"reserved"`
 	Version     int64  `json:"version"`
 }
 
@@ -114,7 +122,63 @@ type RefundRecord struct {
 	CreatedAt        time.Time `json:"created_at"`
 }
 
+// ReservationState 是预占的生命周期状态。
+type ReservationState string
+
+const (
+	// ReservationReserved 预占中：三层额度已保留，等待业务结果。
+	ReservationReserved ReservationState = "reserved"
+	// ReservationConfirmed 已确认：预占转为正式消费（终态）。
+	ReservationConfirmed ReservationState = "confirmed"
+	// ReservationCancelled 已取消：额度退回原窗口（终态）。
+	ReservationCancelled ReservationState = "cancelled"
+	// ReservationExpired 已到期：被系统自动回收，额度退回原窗口（终态）。
+	ReservationExpired ReservationState = "expired"
+)
+
+// Terminal 报告该状态是否为终态。
+func (s ReservationState) Terminal() bool {
+	switch s {
+	case ReservationConfirmed, ReservationCancelled, ReservationExpired:
+		return true
+	}
+	return false
+}
+
+// ReservationRecord 是一次配额预占的持久化记录，同时充当预占幂等键。
+type ReservationRecord struct {
+	RequestID string `json:"request_id"`
+	OrgID     string `json:"org_id"`
+	UserID    string `json:"user_id"`
+	KeyID     string `json:"key_id"`
+	Amount    int64  `json:"amount"`
+	// Windows 记录预占发生时各层级所属窗口的起点。确认、取消、到期回收
+	// 都只能作用于这些窗口，绝不补充已经切换到的新窗口。
+	Windows   map[Level]int64  `json:"windows"`
+	State     ReservationState `json:"state"`
+	ExpiresAt time.Time        `json:"expires_at"`
+	CreatedAt time.Time        `json:"created_at"`
+	// SettledAt 是进入终态（确认/取消/到期）的时间。
+	SettledAt time.Time `json:"settled_at"`
+	// ConsumeRequestID 是确认后生成的正式消费记录的请求号，
+	// 与预占请求号一一对应。
+	ConsumeRequestID string `json:"consume_request_id,omitempty"`
+	Version          int64  `json:"version"`
+}
+
+// subjects 返回预占涉及的三层主体。
+func (r ReservationRecord) subjects() map[Level]string {
+	return map[Level]string{LevelOrg: r.OrgID, LevelUser: r.UserID, LevelKey: r.KeyID}
+}
+
+// sameContent 判断两次同号预占请求的内容是否一致；
+// 过期时长由服务端统一配置，不属于请求内容。
+func (r ReservationRecord) sameContent(orgID, userID, keyID string, amount int64) bool {
+	return r.OrgID == orgID && r.UserID == userID && r.KeyID == keyID && r.Amount == amount
+}
+
 // LevelBalance 是某一层级的余额视图。
+// Remaining = Limit - Used - Reserved，即扣掉正式消费与预占中额度后的可用额度。
 type LevelBalance struct {
 	Level         Level  `json:"level"`
 	SubjectID     string `json:"subject_id"`
@@ -122,8 +186,38 @@ type LevelBalance struct {
 	WindowStart   int64  `json:"window_start"`
 	WindowEnd     int64  `json:"window_end"`
 	Used          int64  `json:"used"`
+	Reserved      int64  `json:"reserved"`
 	Remaining     int64  `json:"remaining"`
 	ConfigVersion int64  `json:"config_version"`
+}
+
+// ReservationResult 是预占接口的返回结果。
+type ReservationResult struct {
+	Reservation ReservationRecord `json:"reservation"`
+	Balances    []LevelBalance    `json:"balances"`
+	Duplicate   bool              `json:"duplicate"`
+}
+
+// ConfirmResult 是确认接口的返回结果。
+type ConfirmResult struct {
+	Reservation ReservationRecord `json:"reservation"`
+	// Consume 是确认后生成（或重放时首次生成）的正式消费记录。
+	Consume   ConsumeRecord  `json:"consume"`
+	Balances  []LevelBalance `json:"balances"`
+	Duplicate bool           `json:"duplicate"`
+}
+
+// CancelResult 是取消接口的返回结果。
+type CancelResult struct {
+	Reservation ReservationRecord `json:"reservation"`
+	Balances    []LevelBalance    `json:"balances"`
+	Duplicate   bool              `json:"duplicate"`
+}
+
+// ExpireResult 描述一次到期回收的结果。
+type ExpireResult struct {
+	// Expired 是本次实际回收的预占请求号。
+	Expired []string `json:"expired"`
 }
 
 // ConsumeResult 是消费接口的返回结果。

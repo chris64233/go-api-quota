@@ -11,13 +11,15 @@ import (
 // 正常负载下冲突极少，重试即可收敛；超过上限说明竞争异常激烈。
 const maxVersionRetries = 8
 
-// Service 实现三层配额的配置、消费、退还与查询。
+// Service 实现三层配额的配置、消费、退还、预占与查询。
 type Service struct {
 	store Store
 	// now 可注入，便于测试窗口切换。
 	now func() time.Time
 	// refundTTL 是消费成功后允许退还的时间范围。
 	refundTTL time.Duration
+	// reservationTTL 是预占的默认有效时长。
+	reservationTTL time.Duration
 }
 
 // Option 定制 Service 行为。
@@ -36,9 +38,10 @@ func WithRefundTTL(d time.Duration) Option {
 // NewService 创建配额服务。
 func NewService(store Store, opts ...Option) *Service {
 	s := &Service{
-		store:     store,
-		now:       time.Now,
-		refundTTL: 24 * time.Hour,
+		store:          store,
+		now:            time.Now,
+		refundTTL:      24 * time.Hour,
+		reservationTTL: defaultReservationTTL,
 	}
 	for _, o := range opts {
 		o(s)
@@ -155,11 +158,11 @@ func (s *Service) Consume(ctx context.Context, req ConsumeRequest) (ConsumeResul
 			if !ok {
 				usage = UsageRecord{Level: level, SubjectID: subjects[level], WindowStart: start}
 			}
-			if usage.Used+req.Amount > cfg.Limit {
+			if usage.Used+usage.Reserved+req.Amount > cfg.Limit {
 				return &insufficientError{
 					level:     level,
 					subjectID: subjects[level],
-					remaining: cfg.Limit - usage.Used,
+					remaining: cfg.Limit - usage.Used - usage.Reserved,
 					amount:    req.Amount,
 				}
 			}
@@ -307,9 +310,10 @@ func loadBalances(tx *Tx, now func() time.Time, subjects map[Level]string) ([]Le
 			return nil, fmt.Errorf("%w: level=%s subject=%s", ErrQuotaNotConfigured, level, subjectID)
 		}
 		start := cfg.WindowStart(now())
-		used := int64(0)
+		var used, reserved int64
 		if usage, ok := tx.GetUsage(level, subjectID, start); ok {
 			used = usage.Used
+			reserved = usage.Reserved
 		}
 		balances = append(balances, LevelBalance{
 			Level:         level,
@@ -318,7 +322,8 @@ func loadBalances(tx *Tx, now func() time.Time, subjects map[Level]string) ([]Le
 			WindowStart:   start,
 			WindowEnd:     start + cfg.WindowSeconds,
 			Used:          used,
-			Remaining:     cfg.Limit - used,
+			Reserved:      reserved,
+			Remaining:     cfg.Limit - used - reserved,
 			ConfigVersion: cfg.Version,
 		})
 	}

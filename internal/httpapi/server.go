@@ -23,6 +23,11 @@ func NewServer(svc *quota.Service) *Server {
 	s.mux.HandleFunc("POST /v1/consume", s.handleConsume)
 	s.mux.HandleFunc("POST /v1/refund", s.handleRefund)
 	s.mux.HandleFunc("GET /v1/balances", s.handleBalances)
+	s.mux.HandleFunc("POST /v1/reservations", s.handleReserve)
+	s.mux.HandleFunc("POST /v1/reservations/confirm", s.handleConfirmReservation)
+	s.mux.HandleFunc("POST /v1/reservations/cancel", s.handleCancelReservation)
+	s.mux.HandleFunc("POST /v1/reservations/expire", s.handleExpireReservations)
+	s.mux.HandleFunc("GET /v1/reservations", s.handleGetReservation)
 	return s
 }
 
@@ -50,6 +55,10 @@ func writeError(w http.ResponseWriter, err error) {
 		status, code = http.StatusNotFound, "quota_not_configured"
 	case errors.Is(err, quota.ErrConsumeNotFound):
 		status, code = http.StatusNotFound, "consume_not_found"
+	case errors.Is(err, quota.ErrReservationNotFound):
+		status, code = http.StatusNotFound, "reservation_not_found"
+	case errors.Is(err, quota.ErrReservationState):
+		status, code = http.StatusConflict, "reservation_state_conflict"
 	case errors.Is(err, quota.ErrInsufficientQuota):
 		status, code = http.StatusConflict, "insufficient_quota"
 	case errors.Is(err, quota.ErrIdempotencyConflict):
@@ -154,4 +163,78 @@ func (s *Server) handleBalances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"balances": balances})
+}
+
+// reservationActionRequest 是确认 / 取消操作的请求体。
+type reservationActionRequest struct {
+	RequestID string `json:"request_id"`
+}
+
+func (s *Server) handleReserve(w http.ResponseWriter, r *http.Request) {
+	var req quota.ReserveRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.Reserve(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleConfirmReservation(w http.ResponseWriter, r *http.Request) {
+	var req reservationActionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.ConfirmReservation(r.Context(), req.RequestID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleCancelReservation(w http.ResponseWriter, r *http.Request) {
+	var req reservationActionRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.CancelReservation(r.Context(), req.RequestID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleExpireReservations(w http.ResponseWriter, r *http.Request) {
+	result, err := s.svc.ExpireDue(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (s *Server) handleGetReservation(w http.ResponseWriter, r *http.Request) {
+	rec, err := s.svc.GetReservation(r.Context(), r.URL.Query().Get("request_id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reservation": rec})
 }

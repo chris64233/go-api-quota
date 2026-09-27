@@ -5,14 +5,43 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/chris64233/go-api-quota/internal/quota"
 )
 
+// httpClock 是 httpapi 测试用的可控时钟。
+type httpClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newHTTPClock() *httpClock {
+	return &httpClock{now: time.Date(2026, 9, 26, 0, 0, 0, 0, time.UTC)}
+}
+
+func (c *httpClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *httpClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	svc := quota.NewService(quota.NewMemoryStore())
+	return newTestServerWithOpts(t)
+}
+
+func newTestServerWithOpts(t *testing.T, opts ...quota.Option) *httptest.Server {
+	t.Helper()
+	svc := quota.NewService(quota.NewMemoryStore(), opts...)
 	srv := httptest.NewServer(NewServer(svc))
 	t.Cleanup(srv.Close)
 	return srv
@@ -157,5 +186,166 @@ func TestHTTPRefundFlow(t *testing.T) {
 	})
 	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "refund_exceeds" {
 		t.Fatalf("exceeds: status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestHTTPReservationFlow(t *testing.T) {
+	srv := newTestServer(t)
+	configureAll(t, srv.URL)
+
+	// 创建预占。
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"amount": 30, "ttl_seconds": 60,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("reserve status=%d body=%v", resp.StatusCode, body)
+	}
+	rsv := body["reservation"].(map[string]any)
+	if rsv["state"] != "reserved" {
+		t.Fatalf("state=%v, want reserved", rsv["state"])
+	}
+	// 余额视图体现 reserved 占用。
+	for _, item := range body["balances"].([]any) {
+		b := item.(map[string]any)
+		if b["reserved"].(float64) != 30 || b["remaining"].(float64) != 70 {
+			t.Errorf("level %v reserved=%v remaining=%v, want 30/70", b["level"], b["reserved"], b["remaining"])
+		}
+	}
+
+	// 同号重放 → 200 duplicate=true，不重复预占。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"amount": 30, "ttl_seconds": 60,
+	})
+	if resp.StatusCode != http.StatusOK || body["duplicate"] != true {
+		t.Fatalf("duplicate reserve status=%d body=%v", resp.StatusCode, body)
+	}
+	// 同号不同内容 → 409 idempotency_conflict。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1", "amount": 31,
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "idempotency_conflict" {
+		t.Fatalf("idempotency: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 查询预占状态。
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/reservations?request_id=rsv1", nil)
+	if resp.StatusCode != http.StatusOK || body["reservation"].(map[string]any)["state"] != "reserved" {
+		t.Fatalf("get reservation status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 确认 → reserved 转为正式消费。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/confirm", map[string]any{"request_id": "rsv1"})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("confirm status=%d body=%v", resp.StatusCode, body)
+	}
+	if body["reservation"].(map[string]any)["state"] != "confirmed" {
+		t.Fatalf("state=%v, want confirmed", body["reservation"])
+	}
+	if body["consume"].(map[string]any)["amount"].(float64) != 30 {
+		t.Fatalf("consume amount=%v, want 30", body["consume"])
+	}
+	// 重复确认 → 200 duplicate=true。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/confirm", map[string]any{"request_id": "rsv1"})
+	if resp.StatusCode != http.StatusOK || body["duplicate"] != true {
+		t.Fatalf("duplicate confirm status=%d body=%v", resp.StatusCode, body)
+	}
+	// 已确认再取消 → 409 reservation_state_conflict。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/cancel", map[string]any{"request_id": "rsv1"})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "reservation_state_conflict" {
+		t.Fatalf("cancel confirmed: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 最终三层余额：used=30，reserved=0。
+	resp, body = doJSON(t, http.MethodGet,
+		srv.URL+"/v1/balances?org_id=org-1&user_id=user-1&key_id=key-1", nil)
+	for _, item := range body["balances"].([]any) {
+		b := item.(map[string]any)
+		if b["used"].(float64) != 30 || b["reserved"].(float64) != 0 || b["remaining"].(float64) != 70 {
+			t.Errorf("level %v used=%v reserved=%v remaining=%v, want 30/0/70",
+				b["level"], b["used"], b["reserved"], b["remaining"])
+		}
+	}
+}
+
+func TestHTTPReservationCancelAndExpire(t *testing.T) {
+	srv := newTestServer(t)
+	configureAll(t, srv.URL)
+
+	// 取消流程。
+	doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1", "amount": 20,
+	})
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/cancel", map[string]any{"request_id": "rsv1"})
+	if resp.StatusCode != http.StatusCreated || body["reservation"].(map[string]any)["state"] != "cancelled" {
+		t.Fatalf("cancel status=%d body=%v", resp.StatusCode, body)
+	}
+	// 取消不存在的预占 → 404 reservation_not_found。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/confirm", map[string]any{"request_id": "ghost"})
+	if resp.StatusCode != http.StatusNotFound || body["error"].(map[string]any)["code"] != "reservation_not_found" {
+		t.Fatalf("not found: status=%d body=%v", resp.StatusCode, body)
+	}
+	// 三层额度已全部释放。
+	resp, body = doJSON(t, http.MethodGet,
+		srv.URL+"/v1/balances?org_id=org-1&user_id=user-1&key_id=key-1", nil)
+	for _, item := range body["balances"].([]any) {
+		b := item.(map[string]any)
+		if b["reserved"].(float64) != 0 || b["remaining"].(float64) != 100 {
+			t.Errorf("level %v reserved=%v remaining=%v, want 0/100", b["level"], b["reserved"], b["remaining"])
+		}
+	}
+
+	// 预占不足整笔失败 → 409 insufficient_quota。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv2", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1", "amount": 101,
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "insufficient_quota" {
+		t.Fatalf("insufficient: status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestHTTPReservationExpirySweep(t *testing.T) {
+	clk := newHTTPClock()
+	srv := newTestServerWithOpts(t,
+		quota.WithClock(clk.Now),
+		quota.WithReservationTTL(time.Minute),
+	)
+	configureAll(t, srv.URL)
+
+	// 默认 TTL 1 分钟的预占。
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1", "amount": 25,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("reserve status=%d body=%v", resp.StatusCode, body)
+	}
+	// 未到期：扫描结果为空。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/expire", nil)
+	if resp.StatusCode != http.StatusOK || len(body["expired"].([]any)) != 0 {
+		t.Fatalf("premature sweep status=%d body=%v", resp.StatusCode, body)
+	}
+	// 到期后扫描：rsv1 被回收。
+	clk.Advance(61 * time.Second)
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/reservations/expire", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sweep status=%d body=%v", resp.StatusCode, body)
+	}
+	expired := body["expired"].([]any)
+	if len(expired) != 1 || expired[0] != "rsv1" {
+		t.Fatalf("expired=%v, want [rsv1]", expired)
+	}
+	// 查询确认状态为 expired，且额度已释放。
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/reservations?request_id=rsv1", nil)
+	if resp.StatusCode != http.StatusOK || body["reservation"].(map[string]any)["state"] != "expired" {
+		t.Fatalf("get expired status=%d body=%v", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, http.MethodGet,
+		srv.URL+"/v1/balances?org_id=org-1&user_id=user-1&key_id=key-1", nil)
+	for _, item := range body["balances"].([]any) {
+		b := item.(map[string]any)
+		if b["reserved"].(float64) != 0 || b["remaining"].(float64) != 100 {
+			t.Errorf("level %v reserved=%v remaining=%v, want 0/100", b["level"], b["reserved"], b["remaining"])
+		}
 	}
 }

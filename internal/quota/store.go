@@ -106,6 +106,38 @@ func (tx *Tx) PutRefund(rec RefundRecord) error {
 	return nil
 }
 
+// GetReservation 按外部请求号读取预占记录。
+func (tx *Tx) GetReservation(requestID string) (rec ReservationRecord, ok bool) {
+	rec, ok = tx.state.Reservations[requestID]
+	return rec, ok
+}
+
+// PutReservation 以 expectedVersion 为条件写入预占记录；新建时传 0。
+func (tx *Tx) PutReservation(rec ReservationRecord, expectedVersion int64) error {
+	cur, ok := tx.state.Reservations[rec.RequestID]
+	if ok && cur.Version != expectedVersion {
+		return fmt.Errorf("%w: reservation %s stored=%d expected=%d",
+			ErrVersionConflict, rec.RequestID, cur.Version, expectedVersion)
+	}
+	if !ok && expectedVersion != 0 {
+		return fmt.Errorf("%w: reservation %s absent, expected version %d",
+			ErrVersionConflict, rec.RequestID, expectedVersion)
+	}
+	rec.Version = expectedVersion + 1
+	tx.state.Reservations[rec.RequestID] = rec
+	return nil
+}
+
+// ListReservations 列出全部预占记录，供到期回收扫描使用。
+// 返回的记录顺序不做保证，调用方不得依赖。
+func (tx *Tx) ListReservations() []ReservationRecord {
+	out := make([]ReservationRecord, 0, len(tx.state.Reservations))
+	for _, rec := range tx.state.Reservations {
+		out = append(out, rec)
+	}
+	return out
+}
+
 // Store 提供事务化的额度数据访问。
 type Store interface {
 	// Update 在写事务中执行 fn；fn 返回错误则整体回滚，
@@ -117,18 +149,20 @@ type Store interface {
 
 // fileState 是持久化到磁盘的全部业务数据。
 type fileState struct {
-	Configs  map[string]QuotaConfig   `json:"configs"`
-	Usages   map[string]UsageRecord   `json:"usages"`
-	Consumes map[string]ConsumeRecord `json:"consumes"`
-	Refunds  map[string]RefundRecord  `json:"refunds"`
+	Configs      map[string]QuotaConfig       `json:"configs"`
+	Usages       map[string]UsageRecord       `json:"usages"`
+	Consumes     map[string]ConsumeRecord     `json:"consumes"`
+	Refunds      map[string]RefundRecord      `json:"refunds"`
+	Reservations map[string]ReservationRecord `json:"reservations"`
 }
 
 func newFileState() *fileState {
 	return &fileState{
-		Configs:  map[string]QuotaConfig{},
-		Usages:   map[string]UsageRecord{},
-		Consumes: map[string]ConsumeRecord{},
-		Refunds:  map[string]RefundRecord{},
+		Configs:      map[string]QuotaConfig{},
+		Usages:       map[string]UsageRecord{},
+		Consumes:     map[string]ConsumeRecord{},
+		Refunds:      map[string]RefundRecord{},
+		Reservations: map[string]ReservationRecord{},
 	}
 }
 
@@ -175,6 +209,9 @@ func (s *fileState) clone() *fileState {
 	}
 	for k, v := range s.Refunds {
 		c.Refunds[k] = v
+	}
+	for k, v := range s.Reservations {
+		c.Reservations[k] = v
 	}
 	return c
 }
