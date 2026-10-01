@@ -28,6 +28,10 @@ func NewServer(svc *quota.Service) *Server {
 	s.mux.HandleFunc("POST /v1/reservations/cancel", s.handleCancelReservation)
 	s.mux.HandleFunc("POST /v1/reservations/expire", s.handleExpireReservations)
 	s.mux.HandleFunc("GET /v1/reservations", s.handleGetReservation)
+	s.mux.HandleFunc("POST /v1/rebalances", s.handleRebalance)
+	s.mux.HandleFunc("GET /v1/rebalances", s.handleGetRebalance)
+	s.mux.HandleFunc("GET /v1/consume-history", s.handleConsumeHistory)
+	s.mux.HandleFunc("GET /v1/reservation-history", s.handleReservationHistory)
 	return s
 }
 
@@ -57,6 +61,8 @@ func writeError(w http.ResponseWriter, err error) {
 		status, code = http.StatusNotFound, "consume_not_found"
 	case errors.Is(err, quota.ErrReservationNotFound):
 		status, code = http.StatusNotFound, "reservation_not_found"
+	case errors.Is(err, quota.ErrRebalanceNotFound):
+		status, code = http.StatusNotFound, "rebalance_not_found"
 	case errors.Is(err, quota.ErrReservationState):
 		status, code = http.StatusConflict, "reservation_state_conflict"
 	case errors.Is(err, quota.ErrInsufficientQuota):
@@ -69,6 +75,8 @@ func writeError(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "refund_window_expired"
 	case errors.Is(err, quota.ErrRefundExceeds):
 		status, code = http.StatusConflict, "refund_exceeds"
+	case errors.Is(err, quota.ErrRebalanceConflict):
+		status, code = http.StatusConflict, "rebalance_conflict"
 	}
 	writeJSON(w, status, errorBody{Error: apiError{Code: code, Message: err.Error()}})
 }
@@ -237,4 +245,104 @@ func (s *Server) handleGetReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reservation": rec})
+}
+
+// rebalanceRequest 是重平衡接口的请求体。三层目标额度分别用
+// org_limit/user_limit/key_limit 给出，服务端校验三者必须全部提供且零和。
+type rebalanceRequest struct {
+	RequestID string `json:"request_id"`
+	OrgID     string `json:"org_id"`
+	UserID    string `json:"user_id"`
+	KeyID     string `json:"key_id"`
+	OrgLimit  int64  `json:"org_limit"`
+	UserLimit int64  `json:"user_limit"`
+	KeyLimit  int64  `json:"key_limit"`
+}
+
+func (s *Server) handleRebalance(w http.ResponseWriter, r *http.Request) {
+	var req rebalanceRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.Rebalance(r.Context(), quota.RebalanceRequest{
+		RequestID: req.RequestID,
+		OrgID:     req.OrgID,
+		UserID:    req.UserID,
+		KeyID:     req.KeyID,
+		TargetLimits: map[quota.Level]int64{
+			quota.LevelOrg:  req.OrgLimit,
+			quota.LevelUser: req.UserLimit,
+			quota.LevelKey:  req.KeyLimit,
+		},
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+// handleGetRebalance 带 request_id 时返回单笔重平衡单；
+// 否则按 org_id/user_id/key_id 过滤返回重平衡历史（均可选，全空返回全部）。
+func (s *Server) handleGetRebalance(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if requestID := q.Get("request_id"); requestID != "" {
+		rec, err := s.svc.GetRebalance(r.Context(), requestID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"rebalance": rec})
+		return
+	}
+	records, err := s.svc.RebalanceHistory(r.Context(), quota.HistoryFilter{
+		OrgID:  q.Get("org_id"),
+		UserID: q.Get("user_id"),
+		KeyID:  q.Get("key_id"),
+	})
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if records == nil {
+		records = []quota.RebalanceRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rebalances": records})
+}
+
+func historyFilterFromQuery(r *http.Request) quota.HistoryFilter {
+	q := r.URL.Query()
+	return quota.HistoryFilter{
+		OrgID:  q.Get("org_id"),
+		UserID: q.Get("user_id"),
+		KeyID:  q.Get("key_id"),
+	}
+}
+
+func (s *Server) handleConsumeHistory(w http.ResponseWriter, r *http.Request) {
+	records, err := s.svc.ConsumeHistory(r.Context(), historyFilterFromQuery(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if records == nil {
+		records = []quota.ConsumeRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"consumes": records})
+}
+
+func (s *Server) handleReservationHistory(w http.ResponseWriter, r *http.Request) {
+	records, err := s.svc.ReservationHistory(r.Context(), historyFilterFromQuery(r))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if records == nil {
+		records = []quota.ReservationRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reservations": records})
 }

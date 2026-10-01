@@ -316,15 +316,16 @@ func loadBalances(tx *Tx, now func() time.Time, subjects map[Level]string) ([]Le
 			reserved = usage.Reserved
 		}
 		balances = append(balances, LevelBalance{
-			Level:         level,
-			SubjectID:     subjectID,
-			Limit:         cfg.Limit,
-			WindowStart:   start,
-			WindowEnd:     start + cfg.WindowSeconds,
-			Used:          used,
-			Reserved:      reserved,
-			Remaining:     cfg.Limit - used - reserved,
-			ConfigVersion: cfg.Version,
+			Level:                  level,
+			SubjectID:              subjectID,
+			Limit:                  cfg.Limit,
+			WindowStart:            start,
+			WindowEnd:              start + cfg.WindowSeconds,
+			Used:                   used,
+			Reserved:               reserved,
+			Remaining:              cfg.Limit - used - reserved,
+			ConfigVersion:          cfg.Version,
+			LastRebalanceRequestID: cfg.LastRebalanceRequestID,
 		})
 	}
 	return balances, nil

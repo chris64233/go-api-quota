@@ -349,3 +349,171 @@ func TestHTTPReservationExpirySweep(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPRebalanceFlow(t *testing.T) {
+	srv := newTestServer(t)
+	configureAll(t, srv.URL)
+
+	// 先制造一笔预占与一笔消费，作为调整依据。
+	doJSON(t, http.MethodPost, srv.URL+"/v1/reservations", map[string]any{
+		"request_id": "rsv1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"amount": 10, "ttl_seconds": 600,
+	})
+
+	// 重平衡：组织 -20、用户 +20，密钥不变。
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/v1/rebalances", map[string]any{
+		"request_id": "rb1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"org_limit": 80, "user_limit": 120, "key_limit": 100,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("rebalance status=%d body=%v", resp.StatusCode, body)
+	}
+	rb := body["rebalance"].(map[string]any)
+	levels := rb["levels"].([]any)
+	if len(levels) != 3 {
+		t.Fatalf("levels=%v, want 3", levels)
+	}
+	wantDelta := map[string]float64{"org": -20, "user": 20, "key": 0}
+	wantLimit := map[string]float64{"org": 80, "user": 120, "key": 100}
+	for _, item := range levels {
+		entry := item.(map[string]any)
+		level := entry["level"].(string)
+		if entry["delta"].(float64) != wantDelta[level] {
+			t.Errorf("level %s delta=%v, want %v", level, entry["delta"], wantDelta[level])
+		}
+		if entry["limit_before"].(float64) != 100 || entry["limit_after"].(float64) != wantLimit[level] {
+			t.Errorf("level %s before/after=%v/%v, want 100/%v",
+				level, entry["limit_before"], entry["limit_after"], wantLimit[level])
+		}
+		if entry["reserved"].(float64) != 10 {
+			t.Errorf("level %s reserved basis=%v, want 10", level, entry["reserved"])
+		}
+		inFlight := entry["in_flight_reservations"].([]any)
+		if len(inFlight) != 1 || inFlight[0] != "rsv1" {
+			t.Errorf("level %s in_flight=%v, want [rsv1]", level, inFlight)
+		}
+	}
+	// 余额反映新额度，used/reserved 不变，并可追溯到重平衡单。
+	for _, item := range body["balances"].([]any) {
+		b := item.(map[string]any)
+		level := b["level"].(string)
+		if b["limit"].(float64) != wantLimit[level] {
+			t.Errorf("level %v limit=%v, want %v", level, b["limit"], wantLimit[level])
+		}
+		if b["reserved"].(float64) != 10 {
+			t.Errorf("level %v reserved=%v, want 10", level, b["reserved"])
+		}
+		if b["last_rebalance_request_id"] != "rb1" {
+			t.Errorf("level %v last_rebalance_request_id=%v, want rb1",
+				level, b["last_rebalance_request_id"])
+		}
+	}
+
+	// 同号同内容重放 → 200 duplicate=true。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/rebalances", map[string]any{
+		"request_id": "rb1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"org_limit": 80, "user_limit": 120, "key_limit": 100,
+	})
+	if resp.StatusCode != http.StatusOK || body["duplicate"] != true {
+		t.Fatalf("duplicate rebalance status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 同号不同目标 → 409 idempotency_conflict。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/rebalances", map[string]any{
+		"request_id": "rb1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"org_limit": 79, "user_limit": 121, "key_limit": 100,
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "idempotency_conflict" {
+		t.Fatalf("idempotency: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 非零和 → 400 validation。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/rebalances", map[string]any{
+		"request_id": "rb2", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"org_limit": 80, "user_limit": 110, "key_limit": 100,
+	})
+	if resp.StatusCode != http.StatusBadRequest || body["error"].(map[string]any)["code"] != "validation" {
+		t.Fatalf("non-zero-sum: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 目标低于已预占 → 409 insufficient_quota，整笔不落地。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/rebalances", map[string]any{
+		"request_id": "rb3", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"org_limit": 5, "user_limit": 195, "key_limit": 100,
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "insufficient_quota" {
+		t.Fatalf("insufficient: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 查询不存在的重平衡单 → 404 rebalance_not_found。
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/rebalances?request_id=ghost", nil)
+	if resp.StatusCode != http.StatusNotFound || body["error"].(map[string]any)["code"] != "rebalance_not_found" {
+		t.Fatalf("not found: status=%d body=%v", resp.StatusCode, body)
+	}
+}
+
+func TestHTTPRebalanceConflictAndHistory(t *testing.T) {
+	clk := newHTTPClock()
+	srv := newTestServerWithOpts(t, quota.WithClock(clk.Now))
+	configureAll(t, srv.URL)
+
+	rb1 := map[string]any{
+		"request_id": "rb1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"org_limit": 80, "user_limit": 120, "key_limit": 100,
+	}
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/v1/rebalances", rb1)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("rb1 status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 窗口滚动后原单重放 → 409 rebalance_conflict。
+	clk.Advance(61 * time.Second)
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/rebalances", rb1)
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "rebalance_conflict" {
+		t.Fatalf("window rotation conflict: status=%d body=%v", resp.StatusCode, body)
+	}
+
+	// 再来一笔调整改变目标额度，原单重放同样冲突。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/rebalances", map[string]any{
+		"request_id": "rb2", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1",
+		"org_limit": 70, "user_limit": 120, "key_limit": 110,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("rb2 status=%d body=%v", resp.StatusCode, body)
+	}
+	// rb2 发生在新窗口且无在途预占：in_flight_reservations 被 omitempty 省略，允许缺失。
+	rb2Levels := body["rebalance"].(map[string]any)["levels"].([]any)
+	if entry := rb2Levels[0].(map[string]any); entry["in_flight_reservations"] != nil {
+		t.Errorf("rb2 should carry no in-flight reservations, got %v", entry["in_flight_reservations"])
+	}
+
+	// 重平衡历史：全部、按主体过滤、单笔查询。
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/rebalances", nil)
+	if resp.StatusCode != http.StatusOK || len(body["rebalances"].([]any)) != 2 {
+		t.Fatalf("history status=%d body=%v", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/rebalances?org_id=org-1", nil)
+	if resp.StatusCode != http.StatusOK || len(body["rebalances"].([]any)) != 2 {
+		t.Fatalf("filtered history status=%d body=%v", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/rebalances?request_id=rb2", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("get one status=%d body=%v", resp.StatusCode, body)
+	}
+	if body["rebalance"].(map[string]any)["request_id"] != "rb2" {
+		t.Fatalf("get one body=%v", body)
+	}
+
+	// 消费历史与预占历史接口。
+	doJSON(t, http.MethodPost, srv.URL+"/v1/consume", map[string]any{
+		"request_id": "c1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1", "amount": 5,
+	})
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/consume-history?key_id=key-1", nil)
+	if resp.StatusCode != http.StatusOK || len(body["consumes"].([]any)) != 1 {
+		t.Fatalf("consume history status=%d body=%v", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, http.MethodGet, srv.URL+"/v1/reservation-history?org_id=org-1", nil)
+	if resp.StatusCode != http.StatusOK || len(body["reservations"].([]any)) != 0 {
+		t.Fatalf("reservation history status=%d body=%v", resp.StatusCode, body)
+	}
+}

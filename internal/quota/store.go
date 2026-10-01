@@ -138,6 +138,48 @@ func (tx *Tx) ListReservations() []ReservationRecord {
 	return out
 }
 
+// GetRebalance 按外部请求号读取重平衡单。
+func (tx *Tx) GetRebalance(requestID string) (rec RebalanceRecord, ok bool) {
+	rec, ok = tx.state.Rebalances[requestID]
+	return rec, ok
+}
+
+// PutRebalance 以 expectedVersion 为条件写入重平衡单；新建时传 0。
+func (tx *Tx) PutRebalance(rec RebalanceRecord, expectedVersion int64) error {
+	cur, ok := tx.state.Rebalances[rec.RequestID]
+	if ok && cur.Version != expectedVersion {
+		return fmt.Errorf("%w: rebalance %s stored=%d expected=%d",
+			ErrVersionConflict, rec.RequestID, cur.Version, expectedVersion)
+	}
+	if !ok && expectedVersion != 0 {
+		return fmt.Errorf("%w: rebalance %s absent, expected version %d",
+			ErrVersionConflict, rec.RequestID, expectedVersion)
+	}
+	rec.Version = expectedVersion + 1
+	tx.state.Rebalances[rec.RequestID] = rec
+	return nil
+}
+
+// ListRebalances 列出全部重平衡单，供历史查询使用。
+// 返回的记录顺序不做保证，调用方需自行排序。
+func (tx *Tx) ListRebalances() []RebalanceRecord {
+	out := make([]RebalanceRecord, 0, len(tx.state.Rebalances))
+	for _, rec := range tx.state.Rebalances {
+		out = append(out, rec)
+	}
+	return out
+}
+
+// ListConsumes 列出全部消费记录（含预占确认生成的消费），供消费历史查询使用。
+// 返回的记录顺序不做保证，调用方需自行排序。
+func (tx *Tx) ListConsumes() []ConsumeRecord {
+	out := make([]ConsumeRecord, 0, len(tx.state.Consumes))
+	for _, rec := range tx.state.Consumes {
+		out = append(out, rec)
+	}
+	return out
+}
+
 // Store 提供事务化的额度数据访问。
 type Store interface {
 	// Update 在写事务中执行 fn；fn 返回错误则整体回滚，
@@ -154,6 +196,7 @@ type fileState struct {
 	Consumes     map[string]ConsumeRecord     `json:"consumes"`
 	Refunds      map[string]RefundRecord      `json:"refunds"`
 	Reservations map[string]ReservationRecord `json:"reservations"`
+	Rebalances   map[string]RebalanceRecord   `json:"rebalances"`
 }
 
 func newFileState() *fileState {
@@ -163,6 +206,7 @@ func newFileState() *fileState {
 		Consumes:     map[string]ConsumeRecord{},
 		Refunds:      map[string]RefundRecord{},
 		Reservations: map[string]ReservationRecord{},
+		Rebalances:   map[string]RebalanceRecord{},
 	}
 }
 
@@ -182,6 +226,10 @@ func OpenFileStore(path string) (*FileStore, error) {
 	case err == nil:
 		if err := json.Unmarshal(data, s.state); err != nil {
 			return nil, fmt.Errorf("decode store %s: %w", path, err)
+		}
+		// 兼容旧版本数据文件：补齐后加的字段，避免后续写入空 map。
+		if s.state.Rebalances == nil {
+			s.state.Rebalances = map[string]RebalanceRecord{}
 		}
 	case os.IsNotExist(err):
 		// 首次运行，使用空状态。
@@ -212,6 +260,9 @@ func (s *fileState) clone() *fileState {
 	}
 	for k, v := range s.Reservations {
 		c.Reservations[k] = v
+	}
+	for k, v := range s.Rebalances {
+		c.Rebalances[k] = v
 	}
 	return c
 }
