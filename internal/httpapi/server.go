@@ -4,6 +4,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/chris64233/go-api-quota/internal/quota"
@@ -28,6 +29,9 @@ func NewServer(svc *quota.Service) *Server {
 	s.mux.HandleFunc("POST /v1/reservations/cancel", s.handleCancelReservation)
 	s.mux.HandleFunc("POST /v1/reservations/expire", s.handleExpireReservations)
 	s.mux.HandleFunc("GET /v1/reservations", s.handleGetReservation)
+	s.mux.HandleFunc("POST /v1/windows/seal", s.handleSealWindow)
+	s.mux.HandleFunc("GET /v1/windows/seals", s.handleGetSeal)
+	s.mux.HandleFunc("GET /v1/windows/statement", s.handleWindowStatement)
 	return s
 }
 
@@ -69,6 +73,14 @@ func writeError(w http.ResponseWriter, err error) {
 		status, code = http.StatusConflict, "refund_window_expired"
 	case errors.Is(err, quota.ErrRefundExceeds):
 		status, code = http.StatusConflict, "refund_exceeds"
+	case errors.Is(err, quota.ErrWindowNotEnded):
+		status, code = http.StatusConflict, "window_not_ended"
+	case errors.Is(err, quota.ErrWindowSealBlocked):
+		status, code = http.StatusConflict, "window_seal_blocked"
+	case errors.Is(err, quota.ErrWindowSealed):
+		status, code = http.StatusConflict, "window_sealed"
+	case errors.Is(err, quota.ErrSealNotFound):
+		status, code = http.StatusNotFound, "seal_not_found"
 	}
 	writeJSON(w, status, errorBody{Error: apiError{Code: code, Message: err.Error()}})
 }
@@ -237,4 +249,55 @@ func (s *Server) handleGetReservation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reservation": rec})
+}
+
+func (s *Server) handleSealWindow(w http.ResponseWriter, r *http.Request) {
+	var req quota.SealRequest
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	result, err := s.svc.SealWindow(r.Context(), req)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if result.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, result)
+}
+
+func (s *Server) handleGetSeal(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var windowStart int64
+	if _, err := fmt.Sscanf(q.Get("window_start"), "%d", &windowStart); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: apiError{
+			Code: "validation", Message: "window_start must be an integer",
+		}})
+		return
+	}
+	seal, err := s.svc.GetSeal(r.Context(), quota.Level(q.Get("level")), q.Get("subject_id"), windowStart)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"seal": seal})
+}
+
+func (s *Server) handleWindowStatement(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var windowStart int64
+	if _, err := fmt.Sscanf(q.Get("window_start"), "%d", &windowStart); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: apiError{
+			Code: "validation", Message: "window_start must be an integer",
+		}})
+		return
+	}
+	statement, err := s.svc.WindowStatement(r.Context(), quota.Level(q.Get("level")), q.Get("subject_id"), windowStart)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, statement)
 }

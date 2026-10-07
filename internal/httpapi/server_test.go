@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -348,4 +349,72 @@ func TestHTTPReservationExpirySweep(t *testing.T) {
 			t.Errorf("level %v reserved=%v remaining=%v, want 0/100", b["level"], b["reserved"], b["remaining"])
 		}
 	}
+}
+
+func TestHTTPWindowSeal(t *testing.T) {
+	clk := newHTTPClock()
+	srv := newTestServerWithOpts(t, quota.WithClock(clk.Now))
+	configureAll(t, srv.URL)
+
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/v1/consume", map[string]any{
+		"request_id": "c1", "org_id": "org-1", "user_id": "user-1", "key_id": "key-1", "amount": 30,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("consume status=%d body=%v", resp.StatusCode, body)
+	}
+	windowStart := int64(clk.Now().Unix()) / 60 * 60
+
+	// 窗口未结束：409 window_not_ended。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/windows/seal", map[string]any{
+		"request_id": "seal-1", "level": "org", "subject_id": "org-1", "window_start": windowStart,
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "window_not_ended" {
+		t.Fatalf("premature seal status=%d body=%v", resp.StatusCode, body)
+	}
+
+	clk.Advance(time.Minute)
+	// 封存成功。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/windows/seal", map[string]any{
+		"request_id": "seal-1", "level": "org", "subject_id": "org-1", "window_start": windowStart,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("seal status=%d body=%v", resp.StatusCode, body)
+	}
+	seal := body["seal"].(map[string]any)
+	if seal["used"].(float64) != 30 || seal["limit"].(float64) != 100 {
+		t.Fatalf("unexpected seal snapshot: %v", seal)
+	}
+	// 同号重试：200 且 duplicate。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/windows/seal", map[string]any{
+		"request_id": "seal-1", "level": "org", "subject_id": "org-1", "window_start": windowStart,
+	})
+	if resp.StatusCode != http.StatusOK || body["duplicate"] != true {
+		t.Fatalf("duplicate seal status=%d body=%v", resp.StatusCode, body)
+	}
+	// 异号同窗口：409 window_sealed。
+	resp, body = doJSON(t, http.MethodPost, srv.URL+"/v1/windows/seal", map[string]any{
+		"request_id": "seal-2", "level": "org", "subject_id": "org-1", "window_start": windowStart,
+	})
+	if resp.StatusCode != http.StatusConflict || body["error"].(map[string]any)["code"] != "window_sealed" {
+		t.Fatalf("re-seal status=%d body=%v", resp.StatusCode, body)
+	}
+	// 查询快照与对账单。
+	resp, body = doJSON(t, http.MethodGet,
+		srv.URL+"/v1/windows/seals?level=org&subject_id=org-1&window_start="+itoa(windowStart), nil)
+	if resp.StatusCode != http.StatusOK || body["seal"].(map[string]any)["used"].(float64) != 30 {
+		t.Fatalf("get seal status=%d body=%v", resp.StatusCode, body)
+	}
+	resp, body = doJSON(t, http.MethodGet,
+		srv.URL+"/v1/windows/statement?level=org&subject_id=org-1&window_start="+itoa(windowStart), nil)
+	if resp.StatusCode != http.StatusOK || body["sealed"] != true {
+		t.Fatalf("statement status=%d body=%v", resp.StatusCode, body)
+	}
+	entries := body["entries"].([]any)
+	if len(entries) != 1 || entries[0].(map[string]any)["request_id"] != "c1" {
+		t.Fatalf("statement entries=%v, want consume c1", entries)
+	}
+}
+
+func itoa(v int64) string {
+	return fmt.Sprintf("%d", v)
 }

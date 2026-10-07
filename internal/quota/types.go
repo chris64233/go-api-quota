@@ -50,6 +50,14 @@ var (
 	ErrReservationNotFound = errors.New("reservation not found")
 	// ErrReservationState 预占当前状态不允许该操作（如对已取消的预占再确认）。
 	ErrReservationState = errors.New("reservation state conflict")
+	// ErrWindowNotEnded 封存的窗口尚未结束。
+	ErrWindowNotEnded = errors.New("window not ended")
+	// ErrWindowSealBlocked 窗口内仍有不允许结算的预占（已到期但未回收），封存被拒绝。
+	ErrWindowSealBlocked = errors.New("window seal blocked by unsettled reservations")
+	// ErrWindowSealed 窗口已封存：拒绝新的消费、预占、重复封存或覆盖快照的操作。
+	ErrWindowSealed = errors.New("window already sealed")
+	// ErrSealNotFound 指定窗口没有封存快照。
+	ErrSealNotFound = errors.New("seal not found")
 )
 
 // QuotaConfig 是某一层级某个主体的配额配置。
@@ -189,6 +197,70 @@ type LevelBalance struct {
 	Reserved      int64  `json:"reserved"`
 	Remaining     int64  `json:"remaining"`
 	ConfigVersion int64  `json:"config_version"`
+}
+
+// OutstandingReservation 是封存时仍未完成（reserved 状态）的预占快照条目。
+type OutstandingReservation struct {
+	RequestID string    `json:"request_id"`
+	Amount    int64     `json:"amount"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// SealRecord 是窗口封存快照：固定某层级某主体在指定窗口结束时的
+// limit、used、reserved 与未完成预占清单。封存后快照不可变，
+// 属于该窗口的确认、取消、到期与退还只更新该窗口的结算账目，
+// 绝不写回快照，也绝不补充新窗口。
+type SealRecord struct {
+	RequestID   string `json:"request_id"`
+	Level       Level  `json:"level"`
+	SubjectID   string `json:"subject_id"`
+	WindowStart int64  `json:"window_start"`
+	WindowEnd   int64  `json:"window_end"`
+	Limit       int64  `json:"limit"`
+	Used        int64  `json:"used"`
+	Reserved    int64  `json:"reserved"`
+	// UsageVersion 是封存瞬间窗口用量记录的版本号，
+	// 用于并发封存与迟到写入的版本判别。
+	UsageVersion int64                    `json:"usage_version"`
+	Outstanding  []OutstandingReservation `json:"outstanding"`
+	SealedAt     time.Time                `json:"sealed_at"`
+	Version      int64                    `json:"version"`
+}
+
+// sameContent 判断两次同号封存请求的内容是否一致。
+func (r SealRecord) sameContent(level Level, subjectID string, windowStart int64) bool {
+	return r.Level == level && r.SubjectID == subjectID && r.WindowStart == windowStart
+}
+
+// SealResult 是封存接口的返回结果。
+type SealResult struct {
+	Seal      SealRecord `json:"seal"`
+	Duplicate bool       `json:"duplicate"`
+}
+
+// WindowEntry 描述形成窗口账目差异的一笔来源记录：
+// 消费、退还或预占（含预占结算）。Amount 是对窗口占用（used+reserved）的带符号影响。
+type WindowEntry struct {
+	Kind      string    `json:"kind"` // consume | refund | reservation_reserve | reservation_settle
+	RequestID string    `json:"request_id"`
+	Amount    int64     `json:"amount"`
+	State     string    `json:"state,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// WindowStatement 是某层级某主体在指定窗口的对账视图：
+// 当前账目、封存快照（若已封存）以及形成差异的来源记录清单。
+type WindowStatement struct {
+	Level       Level         `json:"level"`
+	SubjectID   string        `json:"subject_id"`
+	WindowStart int64         `json:"window_start"`
+	WindowEnd   int64         `json:"window_end"`
+	Limit       int64         `json:"limit"`
+	Used        int64         `json:"used"`
+	Reserved    int64         `json:"reserved"`
+	Sealed      bool          `json:"sealed"`
+	Seal        *SealRecord   `json:"seal,omitempty"`
+	Entries     []WindowEntry `json:"entries"`
 }
 
 // ReservationResult 是预占接口的返回结果。

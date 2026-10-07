@@ -23,6 +23,10 @@ func usageKey(level Level, subjectID string, windowStart int64) string {
 	return fmt.Sprintf("%s/%s/%d", level, subjectID, windowStart)
 }
 
+func sealKey(level Level, subjectID string, windowStart int64) string {
+	return fmt.Sprintf("%s/%s/%d", level, subjectID, windowStart)
+}
+
 // GetConfig 读取配额配置，不存在时 ok=false。
 func (tx *Tx) GetConfig(level Level, subjectID string) (cfg QuotaConfig, ok bool) {
 	cfg, ok = tx.state.Configs[configKey(level, subjectID)]
@@ -138,6 +142,49 @@ func (tx *Tx) ListReservations() []ReservationRecord {
 	return out
 }
 
+// GetSeal 读取某主体在指定窗口的封存快照，不存在时 ok=false。
+func (tx *Tx) GetSeal(level Level, subjectID string, windowStart int64) (rec SealRecord, ok bool) {
+	rec, ok = tx.state.Seals[sealKey(level, subjectID, windowStart)]
+	return rec, ok
+}
+
+// GetSealByRequest 按外部请求号查找封存快照，不存在时 ok=false。
+func (tx *Tx) GetSealByRequest(requestID string) (rec SealRecord, ok bool) {
+	key, ok := tx.state.SealRequests[requestID]
+	if !ok {
+		return SealRecord{}, false
+	}
+	rec, ok = tx.state.Seals[key]
+	return rec, ok
+}
+
+// PutSeal 写入封存快照。同一窗口只允许封存一次；
+// 请求号作为幂等键一并记录，不允许复用到其他窗口。
+func (tx *Tx) PutSeal(rec SealRecord) error {
+	key := sealKey(rec.Level, rec.SubjectID, rec.WindowStart)
+	if _, ok := tx.state.Seals[key]; ok {
+		return fmt.Errorf("%w: window %s already sealed", ErrWindowSealed, key)
+	}
+	if _, ok := tx.state.SealRequests[rec.RequestID]; ok {
+		return fmt.Errorf("%w: seal request %s already used", ErrIdempotencyConflict, rec.RequestID)
+	}
+	rec.Version = 1
+	tx.state.Seals[key] = rec
+	tx.state.SealRequests[rec.RequestID] = key
+	return nil
+}
+
+// ListReservationsForWindow 列出涉及指定主体与窗口的全部预占记录。
+func (tx *Tx) ListReservationsForWindow(level Level, subjectID string, windowStart int64) []ReservationRecord {
+	var out []ReservationRecord
+	for _, rec := range tx.state.Reservations {
+		if rec.subjects()[level] == subjectID && rec.Windows[level] == windowStart {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
 // Store 提供事务化的额度数据访问。
 type Store interface {
 	// Update 在写事务中执行 fn；fn 返回错误则整体回滚，
@@ -154,6 +201,8 @@ type fileState struct {
 	Consumes     map[string]ConsumeRecord     `json:"consumes"`
 	Refunds      map[string]RefundRecord      `json:"refunds"`
 	Reservations map[string]ReservationRecord `json:"reservations"`
+	Seals        map[string]SealRecord        `json:"seals"`
+	SealRequests map[string]string            `json:"seal_requests"`
 }
 
 func newFileState() *fileState {
@@ -163,6 +212,8 @@ func newFileState() *fileState {
 		Consumes:     map[string]ConsumeRecord{},
 		Refunds:      map[string]RefundRecord{},
 		Reservations: map[string]ReservationRecord{},
+		Seals:        map[string]SealRecord{},
+		SealRequests: map[string]string{},
 	}
 }
 
@@ -182,6 +233,13 @@ func OpenFileStore(path string) (*FileStore, error) {
 	case err == nil:
 		if err := json.Unmarshal(data, s.state); err != nil {
 			return nil, fmt.Errorf("decode store %s: %w", path, err)
+		}
+		// 兼容旧版本数据文件：新增字段可能缺失。
+		if s.state.Seals == nil {
+			s.state.Seals = map[string]SealRecord{}
+		}
+		if s.state.SealRequests == nil {
+			s.state.SealRequests = map[string]string{}
 		}
 	case os.IsNotExist(err):
 		// 首次运行，使用空状态。
@@ -212,6 +270,12 @@ func (s *fileState) clone() *fileState {
 	}
 	for k, v := range s.Reservations {
 		c.Reservations[k] = v
+	}
+	for k, v := range s.Seals {
+		c.Seals[k] = v
+	}
+	for k, v := range s.SealRequests {
+		c.SealRequests[k] = v
 	}
 	return c
 }

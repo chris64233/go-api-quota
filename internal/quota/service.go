@@ -154,6 +154,10 @@ func (s *Service) Consume(ctx context.Context, req ConsumeRequest) (ConsumeResul
 			configs[level] = cfg
 			start := cfg.WindowStart(now)
 			windows[level] = start
+			if _, ok := tx.GetSeal(level, subjects[level], start); ok {
+				return fmt.Errorf("%w: level=%s subject=%s window=%d",
+					ErrWindowSealed, level, subjects[level], start)
+			}
 			usage, ok := tx.GetUsage(level, subjects[level], start)
 			if !ok {
 				usage = UsageRecord{Level: level, SubjectID: subjects[level], WindowStart: start}
