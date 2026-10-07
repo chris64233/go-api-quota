@@ -85,6 +85,9 @@ func (s *Service) Reserve(ctx context.Context, req ReserveRequest) (ReservationR
 			}
 			start := cfg.WindowStart(now)
 			windows[level] = start
+			if err := ensureWindowOpen(tx, level, subjects[level], start); err != nil {
+				return err
+			}
 			usage, ok := tx.GetUsage(level, subjects[level], start)
 			if !ok {
 				usage = UsageRecord{Level: level, SubjectID: subjects[level], WindowStart: start}
@@ -296,24 +299,15 @@ func (s *Service) CancelReservation(ctx context.Context, requestID string) (Canc
 // settleReservation 在事务内按终态调整原窗口用量：
 // confirmed 把 reserved 转为 used；cancelled/expired 仅释放 reserved。
 // 所有调整都只作用于预占记录保存的原窗口，与当前窗口无关。
+// 窗口已封存时改为依据封存快照更新结算结果并推进快照版本。
 func settleReservation(tx *Tx, rec ReservationRecord, state ReservationState, now time.Time) (ConsumeRecord, error) {
 	subjects := rec.subjects()
 	for _, level := range Levels {
-		start := rec.Windows[level]
-		usage, ok := tx.GetUsage(level, subjects[level], start)
-		if !ok {
-			return ConsumeRecord{}, fmt.Errorf("%w: usage record missing for level=%s subject=%s window=%d",
-				ErrVersionConflict, level, subjects[level], start)
-		}
-		if usage.Reserved < rec.Amount {
-			return ConsumeRecord{}, fmt.Errorf("%w: reservation %s level=%s reserved=%d settle=%d",
-				ErrVersionConflict, rec.RequestID, level, usage.Reserved, rec.Amount)
-		}
-		usage.Reserved -= rec.Amount
+		var usedDelta int64
 		if state == ReservationConfirmed {
-			usage.Used += rec.Amount
+			usedDelta = rec.Amount
 		}
-		if err := tx.PutUsage(usage, usage.Version); err != nil {
+		if err := adjustWindowUsage(tx, level, subjects[level], rec.Windows[level], usedDelta, -rec.Amount); err != nil {
 			return ConsumeRecord{}, err
 		}
 	}

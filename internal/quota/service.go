@@ -69,6 +69,17 @@ func (s *Service) SetConfig(ctx context.Context, level Level, subjectID string, 
 	}
 	var out QuotaConfig
 	err := s.store.Update(ctx, func(tx *Tx) error {
+		// 已封存的窗口冻结了历史账目：存在封存快照时不允许再调整
+		// 额度上限或窗口长度，避免新配置悄悄改写已发布的结算口径。
+		if cur, ok := tx.GetConfig(level, subjectID); ok &&
+			(cur.Limit != limit || cur.WindowSeconds != windowSeconds) {
+			for _, snap := range tx.ListSeals() {
+				if snap.Level == level && snap.SubjectID == subjectID {
+					return fmt.Errorf("%w: level=%s subject=%s window=%d forbids quota adjustment",
+						ErrWindowSealed, level, subjectID, snap.WindowStart)
+				}
+			}
+		}
 		cfg := QuotaConfig{
 			Level:         level,
 			SubjectID:     subjectID,
@@ -154,6 +165,9 @@ func (s *Service) Consume(ctx context.Context, req ConsumeRequest) (ConsumeResul
 			configs[level] = cfg
 			start := cfg.WindowStart(now)
 			windows[level] = start
+			if err := ensureWindowOpen(tx, level, subjects[level], start); err != nil {
+				return err
+			}
 			usage, ok := tx.GetUsage(level, subjects[level], start)
 			if !ok {
 				usage = UsageRecord{Level: level, SubjectID: subjects[level], WindowStart: start}
@@ -248,20 +262,11 @@ func (s *Service) Refund(ctx context.Context, req RefundRequest) (RefundResult, 
 				ErrRefundExceeds, consume.RequestID, consume.Refundable(), req.Amount)
 		}
 
-		// 回补到原消费记录的窗口，与当前所属窗口无关。
+		// 回补到原消费记录的窗口，与当前所属窗口无关；
+		// 窗口已封存时只依据封存快照更新结算结果。
 		subjects := map[Level]string{LevelOrg: consume.OrgID, LevelUser: consume.UserID, LevelKey: consume.KeyID}
 		for _, level := range Levels {
-			start := consume.Windows[level]
-			usage, ok := tx.GetUsage(level, subjects[level], start)
-			if !ok {
-				return fmt.Errorf("%w: usage record missing for level=%s subject=%s window=%d",
-					ErrVersionConflict, level, subjects[level], start)
-			}
-			usage.Used -= req.Amount
-			if usage.Used < 0 {
-				usage.Used = 0
-			}
-			if err := tx.PutUsage(usage, usage.Version); err != nil {
+			if err := adjustWindowUsage(tx, level, subjects[level], consume.Windows[level], -req.Amount, 0); err != nil {
 				return err
 			}
 		}

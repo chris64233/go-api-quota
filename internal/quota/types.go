@@ -50,6 +50,14 @@ var (
 	ErrReservationNotFound = errors.New("reservation not found")
 	// ErrReservationState 预占当前状态不允许该操作（如对已取消的预占再确认）。
 	ErrReservationState = errors.New("reservation state conflict")
+	// ErrWindowSealed 窗口已封存：拒绝新的消费、预占、额度调整或重复封存。
+	ErrWindowSealed = errors.New("window sealed")
+	// ErrWindowNotEnded 窗口尚未结束，不允许封存。
+	ErrWindowNotEnded = errors.New("window not ended")
+	// ErrWindowNotSealable 窗口内存在无法结算的预占（账目与预占不一致），不允许封存。
+	ErrWindowNotSealable = errors.New("window has unsettleable reservations")
+	// ErrSealNotFound 指定窗口没有封存快照。
+	ErrSealNotFound = errors.New("seal not found")
 )
 
 // QuotaConfig 是某一层级某个主体的配额配置。
@@ -87,6 +95,28 @@ type UsageRecord struct {
 	Used        int64  `json:"used"`
 	Reserved    int64  `json:"reserved"`
 	Version     int64  `json:"version"`
+}
+
+// SealSnapshot 是窗口封存时固定下来的最终账目快照。
+// 封存后该窗口不再接受新的消费、预占与额度调整；属于该窗口的
+// 确认、取消、到期与退还只依据本快照更新结算结果（Used/Reserved），
+// 每次结算推进 Version，旧版本的迟到写入会因版本条件失败，
+// 不会覆盖已经发布的快照。
+type SealSnapshot struct {
+	// RequestID 是首次封存请求的请求号，充当封存幂等键。
+	RequestID   string `json:"request_id"`
+	Level       Level  `json:"level"`
+	SubjectID   string `json:"subject_id"`
+	WindowStart int64  `json:"window_start"`
+	WindowEnd   int64  `json:"window_end"`
+	Limit       int64  `json:"limit"`
+	Used        int64  `json:"used"`
+	Reserved    int64  `json:"reserved"`
+	// OpenReservations 是封存时仍处于 reserved 状态、
+	// 尚未结算的预占请求号清单。
+	OpenReservations []string  `json:"open_reservations"`
+	SealedAt         time.Time `json:"sealed_at"`
+	Version          int64     `json:"version"`
 }
 
 // ConsumeRecord 是一次成功消费的持久化记录，同时充当消费幂等键。
@@ -218,6 +248,41 @@ type CancelResult struct {
 type ExpireResult struct {
 	// Expired 是本次实际回收的预占请求号。
 	Expired []string `json:"expired"`
+}
+
+// SealResult 是窗口封存接口的返回结果。
+type SealResult struct {
+	Snapshot  SealSnapshot `json:"snapshot"`
+	Duplicate bool         `json:"duplicate"`
+}
+
+// WindowEntry 描述形成某个窗口账目差异的一笔记录：
+// 一笔消费、一笔退还或一笔预占。
+type WindowEntry struct {
+	// Kind 为 consume / refund / reservation。
+	Kind      string `json:"kind"`
+	RequestID string `json:"request_id"`
+	// Amount 是该笔记录影响窗口账目的金额：
+	// 消费与确认预占为正（增加 used），退还与取消/到期预占为负。
+	Amount int64 `json:"amount"`
+	// State 仅预占使用，为预占当前状态。
+	State string `json:"state,omitempty"`
+}
+
+// WindowReport 是某个主体在某个窗口的完整账目视图：
+// 当前用量、封存快照（若已封存）以及形成差异的全部记录。
+type WindowReport struct {
+	Level       Level  `json:"level"`
+	SubjectID   string `json:"subject_id"`
+	WindowStart int64  `json:"window_start"`
+	WindowEnd   int64  `json:"window_end"`
+	Limit       int64  `json:"limit"`
+	Used        int64  `json:"used"`
+	Reserved    int64  `json:"reserved"`
+	Sealed      bool   `json:"sealed"`
+	// Snapshot 仅在窗口已封存时存在。
+	Snapshot *SealSnapshot `json:"snapshot,omitempty"`
+	Entries  []WindowEntry `json:"entries"`
 }
 
 // ConsumeResult 是消费接口的返回结果。

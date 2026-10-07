@@ -23,6 +23,10 @@ func usageKey(level Level, subjectID string, windowStart int64) string {
 	return fmt.Sprintf("%s/%s/%d", level, subjectID, windowStart)
 }
 
+func sealKey(level Level, subjectID string, windowStart int64) string {
+	return fmt.Sprintf("%s/%s/%d", level, subjectID, windowStart)
+}
+
 // GetConfig 读取配额配置，不存在时 ok=false。
 func (tx *Tx) GetConfig(level Level, subjectID string) (cfg QuotaConfig, ok bool) {
 	cfg, ok = tx.state.Configs[configKey(level, subjectID)]
@@ -138,6 +142,68 @@ func (tx *Tx) ListReservations() []ReservationRecord {
 	return out
 }
 
+// listConsumes 列出全部消费记录，供窗口账目报表使用。返回顺序不做保证。
+func (tx *Tx) listConsumes() []ConsumeRecord {
+	out := make([]ConsumeRecord, 0, len(tx.state.Consumes))
+	for _, rec := range tx.state.Consumes {
+		out = append(out, rec)
+	}
+	return out
+}
+
+// listRefunds 列出全部退还记录，供窗口账目报表使用。返回顺序不做保证。
+func (tx *Tx) listRefunds() []RefundRecord {
+	out := make([]RefundRecord, 0, len(tx.state.Refunds))
+	for _, rec := range tx.state.Refunds {
+		out = append(out, rec)
+	}
+	return out
+}
+
+// GetSeal 读取某主体在指定窗口的封存快照，不存在时 ok=false。
+func (tx *Tx) GetSeal(level Level, subjectID string, windowStart int64) (snap SealSnapshot, ok bool) {
+	snap, ok = tx.state.Seals[sealKey(level, subjectID, windowStart)]
+	return snap, ok
+}
+
+// GetSealByRequest 按封存请求号查找快照，不存在时 ok=false。
+func (tx *Tx) GetSealByRequest(requestID string) (snap SealSnapshot, ok bool) {
+	for _, s := range tx.state.Seals {
+		if s.RequestID == requestID {
+			return s, true
+		}
+	}
+	return SealSnapshot{}, false
+}
+
+// PutSeal 以 expectedVersion 为条件写入封存快照；新建时传 0。
+// 封存后的每次结算都以快照当前版本为条件推进，旧版本的迟到写入
+// 会得到 ErrVersionConflict，不会覆盖已发布的快照。
+func (tx *Tx) PutSeal(snap SealSnapshot, expectedVersion int64) error {
+	key := sealKey(snap.Level, snap.SubjectID, snap.WindowStart)
+	cur, ok := tx.state.Seals[key]
+	if ok && cur.Version != expectedVersion {
+		return fmt.Errorf("%w: seal %s stored=%d expected=%d",
+			ErrVersionConflict, key, cur.Version, expectedVersion)
+	}
+	if !ok && expectedVersion != 0 {
+		return fmt.Errorf("%w: seal %s absent, expected version %d",
+			ErrVersionConflict, key, expectedVersion)
+	}
+	snap.Version = expectedVersion + 1
+	tx.state.Seals[key] = snap
+	return nil
+}
+
+// ListSeals 列出全部封存快照。返回顺序不做保证。
+func (tx *Tx) ListSeals() []SealSnapshot {
+	out := make([]SealSnapshot, 0, len(tx.state.Seals))
+	for _, snap := range tx.state.Seals {
+		out = append(out, snap)
+	}
+	return out
+}
+
 // Store 提供事务化的额度数据访问。
 type Store interface {
 	// Update 在写事务中执行 fn；fn 返回错误则整体回滚，
@@ -154,6 +220,7 @@ type fileState struct {
 	Consumes     map[string]ConsumeRecord     `json:"consumes"`
 	Refunds      map[string]RefundRecord      `json:"refunds"`
 	Reservations map[string]ReservationRecord `json:"reservations"`
+	Seals        map[string]SealSnapshot      `json:"seals"`
 }
 
 func newFileState() *fileState {
@@ -163,6 +230,7 @@ func newFileState() *fileState {
 		Consumes:     map[string]ConsumeRecord{},
 		Refunds:      map[string]RefundRecord{},
 		Reservations: map[string]ReservationRecord{},
+		Seals:        map[string]SealSnapshot{},
 	}
 }
 
@@ -182,6 +250,9 @@ func OpenFileStore(path string) (*FileStore, error) {
 	case err == nil:
 		if err := json.Unmarshal(data, s.state); err != nil {
 			return nil, fmt.Errorf("decode store %s: %w", path, err)
+		}
+		if s.state.Seals == nil {
+			s.state.Seals = map[string]SealSnapshot{}
 		}
 	case os.IsNotExist(err):
 		// 首次运行，使用空状态。
@@ -212,6 +283,9 @@ func (s *fileState) clone() *fileState {
 	}
 	for k, v := range s.Reservations {
 		c.Reservations[k] = v
+	}
+	for k, v := range s.Seals {
+		c.Seals[k] = v
 	}
 	return c
 }

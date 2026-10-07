@@ -12,6 +12,7 @@
 - **退还**：成功消费在退还时限内（默认 24h，可用 `-refund-ttl` 调整）允许部分或全部退还，可多次退，累计不超过原消费金额；退还请求同样幂等。
 - **预占（reservation）**：预占不立即消费，而是在一个事务内同时保留组织、用户、访问密钥三层当前窗口的可用额度（`reserved`），任一层不足整笔失败。业务结束后可**确认**（reserved 转为正式 used）或**取消**（释放 reserved）；超过有效期（默认 5m，可用 `-reservation-ttl` 调整，也可在请求中用 `ttl_seconds` 指定）未确认则**自动到期回收**。确认、取消、到期只能作用于预占时记录的**原窗口**，窗口切换后绝不补充新窗口。预占状态机为 `reserved → confirmed / cancelled / expired`，后三者为终态，并发操作只形成一个终态。预占同样以 `request_id` 幂等；预占中的额度与正式消费一样占用窗口余额（`remaining = limit - used - reserved`）。
 - **窗口**：左闭右开区间 `[start, start+window_seconds)`，按 Unix 纪元对齐。用量按窗口起点独立记录，因此即使窗口切换与消费、退还、预占结算并发发生，退还与预占结算也只回补原窗口，绝不补充新窗口额度。
+- **窗口封存**：管理员可封存一个**已经结束**的窗口（按层级 + 主体 + 窗口起点）。封存把该窗口的 `limit` / `used` / `reserved` 与未完成预占清单固定为快照；窗口未结束（`window_not_ended`）或存在与账目不一致、无法结算的预占（`window_not_sealable`）时拒绝，且不留下任何半成品。封存后的窗口不再接受新的消费、预占与额度（上限/窗口长度）调整（`window_sealed`）；属于该窗口的确认、取消、到期与退还仍按原请求号处理，但只依据快照更新结算结果并推进快照版本，绝不回补当前新窗口。封存以 `request_id` 幂等：同号同内容返回首次快照，同号异内容返回 `idempotency_conflict`，窗口已被其他请求封存返回 `window_sealed`。封存与结算并发时只形成一个结算版本，旧版本的迟到写入得到 `version_conflict`，不会覆盖已发布的快照。快照随业务数据一起持久化，重启后完整恢复。
 - **持久化**：业务数据（配置、各窗口用量、消费、退还与预占记录）以 JSON 文件原子落盘（临时文件 + rename），重启后状态完整恢复，启动时自动回收重启期间到期的预占。
 
 ## 运行
@@ -35,6 +36,10 @@
 | `refund_window_expired` | 409 | 超出退还时限 |
 | `refund_exceeds` | 409 | 累计退还超过原消费 |
 | `reservation_state_conflict` | 409 | 预占已处于终态，操作不被允许（如确认已取消/已到期的预占） |
+| `window_not_ended` | 409 | 窗口尚未结束，不能封存 |
+| `window_not_sealable` | 409 | 窗口内存在与账目不一致、无法结算的预占，不能封存 |
+| `window_sealed` | 409 | 窗口已封存：拒绝新消费、新预占、额度调整或重复封存 |
+| `seal_not_found` | 404 | 指定窗口没有封存快照 |
 
 ### 配置配额
 
@@ -95,6 +100,32 @@
     GET /v1/balances?org_id=org-1&user_id=u-1&key_id=k-1
 
 返回三个层级当前窗口的 `limit` / `used` / `reserved` / `remaining` 及窗口起止时间。
+
+### 窗口封存
+
+    POST /v1/seals
+    {"request_id": "seal-1", "level": "org", "subject_id": "org-1", "window_start": 1758931200}
+
+`window_start` 必须与该主体的 `window_seconds` 对齐，且窗口已经结束。
+首次成功返回 `201`，快照包含 `limit` / `used` / `reserved` / `open_reservations` 与版本号；
+同号重放返回 `200` 且 `duplicate: true`。
+
+    GET /v1/seals?level=org&subject_id=org-1     # 列出封存快照（参数可省略做过滤）
+
+窗口账目报表：当前用量、封存快照（若已封存，以快照账目为准）以及形成差异的
+每笔消费（正）、退还（负）与预占（含状态）记录：
+
+    GET /v1/windows/report?level=org&subject_id=org-1&window_start=1758931200
+
+**封存后各类操作的允许范围**：
+
+| 操作 | 未封存窗口 | 已封存窗口 |
+|---|---|---|
+| 新消费 / 新预占 | 允许（额度足够时） | 拒绝 `window_sealed` |
+| 额度调整（改 limit / window_seconds） | 允许（带版本条件） | 拒绝 `window_sealed` |
+| 属于该窗口的预占确认 / 取消 / 到期 | 更新窗口用量记录 | 允许，只更新封存快照的结算结果 |
+| 属于该窗口的退还 | 回补窗口用量记录 | 允许，只回补封存快照 |
+| 再次封存 | 允许（窗口已结束） | 同号重放返回首次结果；异号返回 `window_sealed` |
 
 ## 代码结构
 
